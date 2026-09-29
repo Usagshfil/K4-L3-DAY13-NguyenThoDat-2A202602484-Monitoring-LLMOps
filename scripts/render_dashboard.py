@@ -1,0 +1,428 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+import sys
+
+LOG_PATH = Path("data/logs.jsonl")
+OUT_HTML = Path("scripts/dashboard.html")
+
+VIETNAM_TZ = timezone(timedelta(hours=7))
+
+def to_vietnam_dt(ts_str: str) -> datetime | None:
+    if not ts_str:
+        return None
+    try:
+        clean = ts_str.rstrip("Z")
+        dt_utc = datetime.fromisoformat(clean).replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone(VIETNAM_TZ)
+    except Exception:
+        return None
+
+def compute_raw_data() -> dict:
+    if not LOG_PATH.exists():
+        return {"records": []}
+
+    records = []
+    for line in LOG_PATH.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                rec = json.loads(line)
+                dt_vn = to_vietnam_dt(rec.get("ts", ""))
+                if dt_vn:
+                    rec["_vn_ts"] = dt_vn.strftime("%H:%M:%S")
+                    rec["_vn_iso"] = dt_vn.isoformat()
+                    rec["_vn_epoch"] = int(dt_vn.timestamp())
+                else:
+                    rec["_vn_ts"] = ""
+                    rec["_vn_epoch"] = 0
+                records.append(rec)
+            except json.JSONDecodeError:
+                continue
+
+    return {"records": records}
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>K4-L3A Day 13 Monitoring & LLMOps Live Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; margin: 0; padding: 20px; }
+    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 14px; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 22px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+    .status-live { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #34d399; background: #064e3b; padding: 4px 10px; border-radius: 9999px; }
+    .status-dot { width: 8px; height: 8px; background: #34d399; border-radius: 50%; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+    .meta { font-size: 13px; color: #94a3b8; }
+    .tz-badge { background: #1e293b; color: #38bdf8; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+    
+    /* Time Filter Bar */
+    .filter-bar { display: flex; align-items: center; gap: 10px; background: #131b2e; border: 1px solid #1e293b; padding: 10px 16px; border-radius: 8px; margin-bottom: 18px; }
+    .filter-title { font-size: 13px; font-weight: 600; color: #94a3b8; }
+    .btn-time { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 6px 12px; font-size: 12px; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+    .btn-time:hover { background: #334155; color: #fff; }
+    .btn-time.active { background: #0284c7; border-color: #38bdf8; color: #fff; font-weight: 600; }
+    .custom-input { background: #0b0f19; border: 1px solid #334155; color: #f1f5f9; padding: 5px 8px; border-radius: 6px; font-size: 12px; }
+
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .panel { background: #131b2e; border: 1px solid #1e293b; border-radius: 10px; padding: 16px; position: relative; }
+    .panel-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+    .panel-title { font-size: 14px; font-weight: 600; color: #cbd5e1; }
+    .panel-val { font-size: 24px; font-weight: 700; color: #38bdf8; }
+    .threshold-tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #0369a1; color: #e0f2fe; }
+    .chart-container { height: 170px; width: 100%; position: relative; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>K4-L3A Day 13 Monitoring & LLMOps Dashboard</h1>
+      <div class="meta">Timezone: <span class="tz-badge">Asia/Ho_Chi_Minh (UTC+7)</span> | Source: <code>data/logs.jsonl</code> | Auto-refresh: 3s</div>
+    </div>
+    <div class="status-live"><div class="status-dot"></div> LIVE MONITORING</div>
+  </div>
+
+  <!-- Time Filter Toolbar -->
+  <div class="filter-bar">
+    <span class="filter-title">&#9201; Time Range:</span>
+    <button class="btn-time active" id="btn-all" onclick="setTimePreset('all')">All</button>
+    <button class="btn-time" id="btn-60m" onclick="setTimePreset('60m')">Last 60m</button>
+    <button class="btn-time" id="btn-15m" onclick="setTimePreset('15m')">Last 15m</button>
+    <button class="btn-time" id="btn-5m" onclick="setTimePreset('5m')">Last 5m</button>
+    <span style="color:#475569;margin:0 4px;">|</span>
+    <span style="font-size:12px;color:#94a3b8;">Custom:</span>
+    <input type="time" id="time-start" class="custom-input" step="1" title="Start Time (HH:MM:SS)">
+    <span style="color:#64748b;">to</span>
+    <input type="time" id="time-end" class="custom-input" step="1" title="End Time (HH:MM:SS)">
+    <button class="btn-time" onclick="applyCustomTime()">Apply Range</button>
+    <button class="btn-time" onclick="setTimePreset('all')" style="background:#334155;">Reset</button>
+    <span id="range-info" style="font-size:12px;color:#38bdf8;margin-left:auto;">Showing: All records</span>
+  </div>
+
+  <div class="grid">
+    <!-- Panel 1: Latency -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">1. Latency & TTFT (ms)</span>
+        <span class="threshold-tag">SLO &le; 3000ms</span>
+      </div>
+      <div class="panel-val" id="val-p95">-- ms (P95)</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;" id="val-sublat">P50: -- | P99: -- | TTFT P95: --</div>
+      <div class="chart-container"><canvas id="chart-latency"></canvas></div>
+    </div>
+
+    <!-- Panel 2: Traffic -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">2. Request Traffic (count)</span>
+        <span class="threshold-tag">Rate &ge; 1 req/min</span>
+      </div>
+      <div class="panel-val" id="val-traffic">-- req</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;" id="val-subtraf">Rate in window</div>
+      <div class="chart-container"><canvas id="chart-traffic"></canvas></div>
+    </div>
+
+    <!-- Panel 3: Errors -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">3. Error Rate & Retrieval</span>
+        <span class="threshold-tag">Err &le; 2% | Ret &ge; 90%</span>
+      </div>
+      <div class="panel-val" id="val-err">-- %</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;" id="val-tool">Retrieval Success: -- %</div>
+      <div class="chart-container"><canvas id="chart-errors"></canvas></div>
+    </div>
+
+    <!-- Panel 4: Cost -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">4. Cost in Window (USD)</span>
+        <span class="threshold-tag">Limit &le; $2.50</span>
+      </div>
+      <div class="panel-val" id="val-cost">$ --</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;">Window cumulative cost</div>
+      <div class="chart-container"><canvas id="chart-cost"></canvas></div>
+    </div>
+
+    <!-- Panel 5: Tokens -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">5. Tokens (In / Out)</span>
+        <span class="threshold-tag">Tokens &le; 50,000</span>
+      </div>
+      <div class="panel-val" id="val-tokens">-- tokens</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;">Input vs Output distribution</div>
+      <div class="chart-container"><canvas id="chart-tokens"></canvas></div>
+    </div>
+
+    <!-- Panel 6: Quality -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">6. Quality Proxy Score</span>
+        <span class="threshold-tag">Mean &ge; 0.75</span>
+      </div>
+      <div class="panel-val" id="val-quality">-- / 1.0</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;">Heuristic quality evaluation</div>
+      <div class="chart-container"><canvas id="chart-quality"></canvas></div>
+    </div>
+  </div>
+
+  <script>
+    let allRecords = [];
+    let currentFilterMode = 'all'; // 'all', '60m', '15m', '5m', 'custom'
+    let customStart = null;
+    let customEnd = null;
+    let charts = {};
+
+    const chartDefaults = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: true, labels: { color: '#94a3b8', font: { size: 10 } } } },
+      scales: {
+        x: { ticks: { color: '#64748b', font: { size: 9 }, maxTicksLimit: 8 }, grid: { color: '#1e293b' } },
+        y: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: '#1e293b' } }
+      }
+    };
+
+    function calculatePercentile(values, p) {
+      if (!values || values.length === 0) return 0;
+      const s = [...values].sort((a, b) => a - b);
+      const k = (s.length - 1) * (p / 100);
+      const f = Math.floor(k);
+      const c = f + 1;
+      if (c < s.length) {
+        return Math.round((s[f] + (k - f) * (s[c] - s[f])) * 100) / 100;
+      }
+      return Math.round(s[f] * 100) / 100;
+    }
+
+    function initCharts() {
+      charts.latency = new Chart(document.getElementById('chart-latency'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+          { label: 'Latency (ms)', borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.15)', data: [], tension: 0.2, fill: true },
+          { label: 'TTFT (ms)', borderColor: '#a855f7', data: [], borderDash: [3, 3] },
+          { label: 'P95 Threshold (3000ms)', borderColor: '#ef4444', borderDash: [5, 5], data: [], pointRadius: 0 }
+        ]},
+        options: chartDefaults
+      });
+
+      charts.traffic = new Chart(document.getElementById('chart-traffic'), {
+        type: 'bar',
+        data: { labels: [], datasets: [{ label: 'Requests', backgroundColor: '#3b82f6', data: [] }] },
+        options: chartDefaults
+      });
+
+      charts.errors = new Chart(document.getElementById('chart-errors'), {
+        type: 'doughnut',
+        data: { labels: ['Success', 'Failed'], datasets: [{ data: [1, 0], backgroundColor: ['#10b981', '#ef4444'] }] },
+        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#94a3b8' } } } }
+      });
+
+      charts.cost = new Chart(document.getElementById('chart-cost'), {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'Cumulative ($)', borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.15)', data: [], fill: true, tension: 0.2 }] },
+        options: chartDefaults
+      });
+
+      charts.tokens = new Chart(document.getElementById('chart-tokens'), {
+        type: 'bar',
+        data: { labels: [], datasets: [
+          { label: 'Tokens In', backgroundColor: '#0284c7', data: [] },
+          { label: 'Tokens Out', backgroundColor: '#f59e0b', data: [] }
+        ]},
+        options: { ...chartDefaults, scales: { ...chartDefaults.scales, x: { stacked: true }, y: { stacked: true } } }
+      });
+
+      charts.quality = new Chart(document.getElementById('chart-quality'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+          { label: 'Score', borderColor: '#facc15', backgroundColor: 'rgba(250,204,21,0.15)', data: [], tension: 0.2, fill: true },
+          { label: 'SLO (0.75)', borderColor: '#ef4444', borderDash: [4, 4], data: [], pointRadius: 0 }
+        ]},
+        options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { min: 0, max: 1.0 } } }
+      });
+    }
+
+    function setTimePreset(mode) {
+      currentFilterMode = mode;
+      document.querySelectorAll('.filter-bar .btn-time').forEach(b => b.classList.remove('active'));
+      const activeBtn = document.getElementById(`btn-${mode}`);
+      if (activeBtn) activeBtn.classList.add('active');
+      renderCurrentView();
+    }
+
+    function applyCustomTime() {
+      const s = document.getElementById('time-start').value;
+      const e = document.getElementById('time-end').value;
+      if (!s || !e) {
+        alert("Please select both start time and end time (HH:MM:SS)");
+        return;
+      }
+      currentFilterMode = 'custom';
+      customStart = s;
+      customEnd = e;
+      document.querySelectorAll('.filter-bar .btn-time').forEach(b => b.classList.remove('active'));
+      renderCurrentView();
+    }
+
+    function filterRecords() {
+      if (!allRecords || allRecords.length === 0) return [];
+      if (currentFilterMode === 'all') {
+        document.getElementById('range-info').innerText = `Showing: All (${allRecords.length} records)`;
+        return allRecords;
+      }
+
+      if (currentFilterMode === 'custom') {
+        document.getElementById('range-info').innerText = `Showing: ${customStart} - ${customEnd}`;
+        return allRecords.filter(r => {
+          const t = r._vn_ts;
+          return t && t >= customStart && t <= customEnd;
+        });
+      }
+
+      // Minutes window
+      const mins = currentFilterMode === '5m' ? 5 : (currentFilterMode === '15m' ? 15 : 60);
+      document.getElementById('range-info').innerText = `Showing: Last ${mins} minutes`;
+
+      const epochs = allRecords.map(r => r._vn_epoch).filter(Boolean);
+      if (epochs.length === 0) return allRecords;
+      const maxEpoch = Math.max(...epochs);
+      const cutoff = maxEpoch - (mins * 60);
+
+      return allRecords.filter(r => r._vn_epoch >= cutoff);
+    }
+
+    function renderCurrentView() {
+      const records = filterRecords();
+      const resp_records = records.filter(r => r.event === 'response_sent');
+
+      const latencies = resp_records.map(r => r.latency_ms || 0);
+      const ttfts = resp_records.map(r => r.ttft_ms || 0);
+      const p50 = calculatePercentile(latencies, 50);
+      const p95 = calculatePercentile(latencies, 95);
+      const p99 = calculatePercentile(latencies, 99);
+      const ttft_p95 = calculatePercentile(ttfts, 95);
+
+      const req_received = records.filter(r => r.event === 'request_received').length;
+      const req_failed = records.filter(r => r.event === 'request_failed').length;
+      const error_rate = Math.round((req_failed / Math.max(req_received, 1)) * 10000) / 100;
+
+      const tools_total = records.filter(r => r.tool_name === 'retrieval').length;
+      const tools_success = records.filter(r => r.tool_name === 'retrieval' && r.tool_success === true).length;
+      const tool_success_rate = Math.round((tools_success / Math.max(tools_total, 1)) * 10000) / 100;
+
+      const total_cost = Math.round(resp_records.reduce((acc, r) => acc + (r.cost_usd || 0), 0) * 100000) / 100000;
+      const tokens_in = resp_records.reduce((acc, r) => acc + (r.tokens_in || 0), 0);
+      const tokens_out = resp_records.reduce((acc, r) => acc + (r.tokens_out || 0), 0);
+
+      const scores = resp_records.map(r => r.quality_score || 0);
+      const avg_quality = scores.length ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 1000) / 1000 : 0;
+
+      // Update text values
+      document.getElementById('val-p95').innerText = `${p95} ms (P95)`;
+      document.getElementById('val-sublat').innerText = `P50: ${p50}ms | P99: ${p99}ms | TTFT P95: ${ttft_p95}ms`;
+      document.getElementById('val-traffic').innerText = `${req_received} req`;
+      document.getElementById('val-subtraf').innerText = `Failed: ${req_failed} req | Total: ${records.length} logs`;
+      document.getElementById('val-err').innerText = `${error_rate} %`;
+      document.getElementById('val-tool').innerText = `Retrieval Success: ${tool_success_rate}%`;
+      document.getElementById('val-cost').innerText = `$${total_cost}`;
+      document.getElementById('val-tokens').innerText = `${(tokens_in + tokens_out).toLocaleString()} tokens`;
+      document.getElementById('val-quality').innerText = `${avg_quality} / 1.0`;
+
+      // Series data
+      const timestamps = resp_records.map(r => r._vn_ts);
+      let cumCost = 0;
+      const cumulativeCosts = resp_records.map(r => {
+        cumCost += (r.cost_usd || 0);
+        return Math.round(cumCost * 100000) / 100000;
+      });
+
+      charts.latency.data.labels = timestamps;
+      charts.latency.data.datasets[0].data = latencies;
+      charts.latency.data.datasets[1].data = ttfts;
+      charts.latency.data.datasets[2].data = timestamps.map(() => 3000);
+      charts.latency.update();
+
+      charts.traffic.data.labels = timestamps;
+      charts.traffic.data.datasets[0].data = timestamps.map(() => 1);
+      charts.traffic.update();
+
+      charts.errors.data.datasets[0].data = [req_received - req_failed, req_failed];
+      charts.errors.update();
+
+      charts.cost.data.labels = timestamps;
+      charts.cost.data.datasets[0].data = cumulativeCosts;
+      charts.cost.update();
+
+      charts.tokens.data.labels = timestamps;
+      charts.tokens.data.datasets[0].data = resp_records.map(r => r.tokens_in || 0);
+      charts.tokens.data.datasets[1].data = resp_records.map(r => r.tokens_out || 0);
+      charts.tokens.update();
+
+      charts.quality.data.labels = timestamps;
+      charts.quality.data.datasets[0].data = scores;
+      charts.quality.data.datasets[1].data = timestamps.map(() => 0.75);
+      charts.quality.update();
+    }
+
+    async function refreshData() {
+      try {
+        const res = await fetch('/api/raw');
+        if (!res.ok) return;
+        const data = await res.json();
+        allRecords = data.records || [];
+        renderCurrentView();
+      } catch (e) {}
+    }
+
+    window.onload = () => {
+      initCharts();
+      refreshData();
+      setInterval(refreshData, 3000);
+    };
+  </script>
+</body>
+</html>
+"""
+
+class LiveDashboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/api/raw":
+            data = compute_raw_data()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        return
+
+def main():
+    OUT_HTML.write_text(HTML_TEMPLATE, encoding="utf-8")
+    
+    port = 8501
+    print(f"==================================================")
+    print(f" [OK] LIVE DASHBOARD WITH CUSTOM TIME RANGE FILTER")
+    print(f" URL: http://localhost:{port}")
+    print(f" Press Ctrl+C to stop.")
+    print(f"==================================================")
+    
+    server = HTTPServer(("0.0.0.0", port), LiveDashboardHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping dashboard server.")
+
+if __name__ == "__main__":
+    main()
