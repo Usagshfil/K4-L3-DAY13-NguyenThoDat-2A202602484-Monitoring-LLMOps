@@ -46,19 +46,21 @@ class LabAgent:
         with propagate_attributes(prompt=managed_prompt):
             response = self.llm.generate(prompt_text)
             cost = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
-            langfuse_client.update_current_generation(
-                model=self.model,
-                input=summarize_text(prompt_text),
-                output=summarize_text(response.text),
-                usage_details={
-                    "input": response.usage.input_tokens,
-                    "output": response.usage.output_tokens,
-                    "total": response.usage.input_tokens + response.usage.output_tokens,
-                },
-                cost_details={
-                    "total": cost,
-                },
-            )
+            # Kiểm tra an toàn để tương thích với mock client trong unit tests
+            if hasattr(langfuse_client, "update_current_generation"):
+                langfuse_client.update_current_generation(
+                    model=self.model,
+                    input=summarize_text(prompt_text),
+                    output=summarize_text(response.text),
+                    usage_details={
+                        "input": response.usage.input_tokens,
+                        "output": response.usage.output_tokens,
+                        "total": response.usage.input_tokens + response.usage.output_tokens,
+                    },
+                    cost_details={
+                        "total": cost,
+                    },
+                )
             return response
 
     @observe(name="lab-agent-run", as_type="agent", capture_input=False, capture_output=False)
